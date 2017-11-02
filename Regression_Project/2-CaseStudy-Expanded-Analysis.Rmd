@@ -1,0 +1,1587 @@
+---
+title: 'Case Study: Iowa Housing Prices'
+author: "Tim Lee, Taylor Pellerin, Jake Toffler, Ian Smeenk, Alex Howard"
+date: "10/4/2017"
+output: 
+  pdf_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())            # removes all objects from the environment
+cat("\014")              # clears the console
+library(tidyverse)
+library(magrittr)
+library(dplyr)
+library(glmnet)
+library(caret)
+library(knitr)
+library(cvTools)
+library(caTools)
+library(ggplot2)
+library(car)
+library(MASS)
+library(olsrr)
+options("scipen" = 10)
+# force default function masking 
+select <- dplyr::select
+knitr::opts_chunk$set(echo = TRUE, fig.show = "hide", cache=F, tidy.opts = list(width.cutoff = 60), tidy=TRUE)
+
+# ----------------------------------------------------------------------------
+# Hidden functions used later for plotting
+# ----------------------------------------------------------------------------
+
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+
+  numPlots = length(plots)
+
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                    ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+
+ if (numPlots==1) {
+    print(plots[[1]])
+
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+
+# ----------------------------------------------------------------------------
+# Used for Boxcox, but defined later
+# ----------------------------------------------------------------------------
+DealWithNulls <- function(df){
+  drop_fields = c('LotFrontage',
+                  'Alley',
+                  'PoolQC',
+                  'Fence',
+                  'MiscFeature',
+                  'FireplaceQu')
+  
+  df_clean <- data.frame(df) %>% 
+    select(-LotFrontage,
+           -Alley,
+           -PoolQC, 
+           -Fence,
+           -MiscFeature,
+           -FireplaceQu, 
+           -Utilities) %>% 
+    data.frame
+  return(df_clean)
+}
+```
+
+\pagebreak
+
+
+# EDA Summary:
+
+### Changing the sales price response field to log(sales price) for normality reasons
+
+After checking for normality, the sales price fails the two sided K-S test, forcing us to reject the null hypothesis. Then transforming the sales price into log(sales price), we find we keep the null hypothesis and the response variable is normal. 
+
+### Dropping Null Fields
+
+A number of the fields were predominantly null. The following features were over 20% null and were excluded from the data:
+
+- Lot Frontage
+- Alley
+- PoolQC
+- Fence
+- MiscFeature
+- FireplaceQu
+
+### Converting String Quality Descriptions into numerics
+
+Many of the fields had discrete ratings such as "excellent", "good" etc. All of these related fields were changed to a ~10 point scale listed below. 
+
+|Numeric Assigned | Str Encoding | Data Dictionary Description|
+|----|----|---|
+|9|Ex|Excellent|
+|7|Gd|Good|
+|5|TA|Average/Typical|
+|3|Fa|Fair|
+|1|Po|Poor|
+|0|NA|No basement|
+
+### Transform dates into years old (continuous)
+
+Many of the year related fields such as the year built, or the year modified, or year of the garage were transformed into continous "age" in years. The reference date to make this calculation is 2010 which is the most recent data in the fields. For example 
+
+#### 2010 (current) - 2007 year built = house is 3 years old
+
+
+### Imputing missing values
+
+Depending on the field that was missing values, either the NA was replaced with a "None" for fields such as garage type. Or the "average" value was imputed instead like "Standard Breaker". In other cases the NA was a proxy for 0. For all the qualitative fields, the NA's were considered a rating of 0 (mainly for the size of the basement)
+
+### Convert specific fields to factors
+
+The primary field that was converted to factors was the MSSubClass. The other fields under consideration were number of bedrooms, kitchens, bathes. Should these be considered discrete fields? Technically there is no such thing as 2.35 bedrooms. The final model left these counting fields as continuous integers, but will be discussed more later.
+
+### Detecting Outliers
+
+DFFITs was used to identify influential outliers in the data. These 59 row observations were excluded from the future analysis.
+
+### Removing Collinear Fields
+
+These fields have been removed from tweaking and research during OLS, Lasso, or Ridge analysis.
+- TotalBsmtSF: this can be calculated from BsmtSF1 and BsmtSF2 added together
+- BldgType: this is covered more detail in the MSSubClass: Identifies the type of dwelling involved in the sale.	So this is unnecessary
+- Combining Exterior Fields, Exterior1st,Exterior2nd, 
+
+### Removing imbalanced fields - these are fields where a high % of the field is the same value
+
+A histogram analysis was performed on all fields. The following fields had >= 90% one value so were dropped as predictors for this study:
+
+- Condition2
+- Heating
+- RoofMatl
+- X3SsnPorch
+- LowQualFinSF
+- KitchenAbvGr
+- MiscVal
+- LandSlope
+- CentralAir
+- BsmtHalfBath
+- Functional
+- PavedDrive
+- Electrical
+- ScreenPorch
+- GarageQual
+- LandContour
+
+\pagebreak
+
+# Detailed EDA Analysis, Walkthrough and Code
+
+## Load the Data
+```{r}
+# load the kaggle CSV
+df <- read.csv('~/Documents/MSAN/04-601-LinRegression/Project/housing.txt', stringsAsFactors = FALSE)
+```
+
+# EDA: Examination of the Response Variable (Testing for Normality):
+
+## Boxcox Examination
+
+```{r fig.width=7, fig.height=4}
+y_resp <- df$SalePrice %>% unlist
+X<- df %>% select(-SalePrice) %>% DealWithNulls
+fit.model <- lm(y_resp ~ .,X)
+
+res <- boxcox(lm(y_resp ~ .,X), plotit=T, lambda=seq(0,1,by=.5))
+
+
+```
+
+## Optimal Transform - Y to the power of 0.13, close to 0, will continue to use log
+```{r}
+data.frame(res) %>% arrange(desc(y)) %>% head(5) %>% kable
+
+
+# make a function to do the transformation for later
+bcTrans <- function(val){
+  return((val^0.131)/0.131)
+}
+```
+
+
+## Plot the histogram of Sale Price (not transformed)
+
+```{r fig.width=7, fig.height=3}
+df %>% 
+  select(SalePrice) %>% 
+  ggplot(aes(x=SalePrice)) + 
+  geom_histogram(bins=40) + 
+  labs(x='Sales Price of House', title='Histogram of Sales Price in Iowa')
+
+```
+
+##  K-S test of Sale Price (untransformed)
+
+From the K-S test we see we must reject the null hypothesis that hte data is normal
+
+```{r}
+set.seed(1)
+sale_price <- df %>% 
+  select(SalePrice) %>% 
+  unlist
+
+n_y <- length(sale_price)
+sale_price_norm <- (sale_price-mean(sale_price))/sd(sale_price)
+std_norm <- rnorm(n =n_y,mean = 0, sd = 1 )
+
+ks.test(sale_price_norm,std_norm)
+
+```
+
+##  K-S test of log(Sale Price)
+
+Since the distribution of the sale price is skewed, we will try and apply a log transformation and retest under the Kolmagorov-Test
+
+```{r}
+set.seed(1)
+log_sale_price <- log(sale_price)
+log_sale_price_norm <- (log_sale_price-mean(log_sale_price))/sd(log_sale_price)
+std_norm <- rnorm(n =n_y,mean = 0, sd = 1 )
+
+
+ks.test(log_sale_price_norm,std_norm)
+
+```
+
+## Plot the histogram of log(Sale Price)
+
+
+```{r fig.width=7, fig.height=3}
+df %>% 
+  select(SalePrice) %>% 
+  log %>% 
+  ggplot(aes(x=SalePrice)) + 
+  geom_histogram(bins=40) + 
+  labs(x='Log Sales Price of House', title='Histogram of Log(Sales Price) in Iowa')
+```
+
+\pagebreak
+
+# EDA: Cleaning up the data with a Pipeline
+
+## Function: Dropping nulls, based on histogram statistics
+
+This will be accomplished by checking for number of nulls
+
+```{r}
+null_columns <- colSums(is.na(df))
+sort(null_columns[null_columns >0]/n_y, decreasing=T) %>% head(10) %>%  kable(caption = 'Field Null%', col.names = c('%Null'))
+```
+
+
+
+## Function: Dealing with Nulls
+
+Anything with more than 20% more nulls, the field is dropped. The fields dropped are as follows:
+
+- Lot Frontage
+- Alley
+- PoolQC
+- Fence
+- MiscFeature
+- FireplaceQu
+
+```{r}
+# Drop fields with around 280 nulls (20%)
+DealWithNulls <- function(df){
+  drop_fields = c('LotFrontage',
+                  'Alley',
+                  'PoolQC',
+                  'Fence',
+                  'MiscFeature',
+                  'FireplaceQu')
+  
+  df_clean <- data.frame(df) %>% 
+    select(-LotFrontage,
+           -Alley,
+           -PoolQC, 
+           -Fence,
+           -MiscFeature,
+           -FireplaceQu, 
+           -Utilities) %>% 
+    data.frame
+  return(df_clean)
+}
+```
+
+## Function: transform dates into years old
+
+Will assume that the current year is 2010
+
+```{r}
+
+Years_to_Age <- function(df){
+  df_clean <- data.frame(df)
+  df_clean$GarageYrBlt <- as.integer(2010 - df$GarageYrBlt)
+  df_clean$YrSold <- as.integer(2010 - df$YrSold)
+  df_clean$YearBuilt <- as.integer(2010 - df$YearBuilt)
+  df_clean$YearRemodAdd <- as.integer(2010- df$YearRemodAdd)
+  return(df_clean)
+}
+```
+
+## Function: Fixing fields of MS Sub Class: Turning Numerics into Factors
+
+- There is a zoning field that has numeric values that we force into a categorical factor type.
+- All counting factors were switched to factors ( room counts, bath counts)
+- Month was changed to factor
+
+```{r}
+SwapToFactor <- function(df){
+  
+  # setup a copy (to prevent from looping with the same variable name)
+  df_clean <- data.frame(df)
+  
+  # Convert numerics into factors
+  df_clean$MSSubClass <- factor(df$MSSubClass, 
+                                levels = c(20,30, 40, 45, 50, 60, 70, 75, 80, 85, 90, 120, 150, 160, 180, 190), 
+                                labels = c('1LVL>1946','1LVL<1945','1LVL_W_ATTIC','1.5LVL_UNF',
+                                           '1.5LVL_FIN','2LVL>1946','2LVL<1945','2.5LVL','SPLIT',
+                                           'SPLIT_FOYER','DUPLEX','1LVL_PUD>1946','1.5LVL_PUD','2LVL_PUD>1946',
+                                           'MULTI_PUD','2FAM_CONV'))
+  return(df_clean)
+}
+
+
+RoomsToFactor <- function(df){
+  # setup a copy (to prevent from looping with the same variable name)
+  df_clean <- data.frame(df)
+  
+  df_clean$BsmtFullBath <- factor(df$BsmtFullBath)
+  df_clean$BsmtHalfBath <- factor(df$BsmtHalfBath)
+  df_clean$FullBath <- factor(df$FullBath)
+  df_clean$HalfBath <- factor(df$HalfBath)
+  df_clean$BedroomAbvGr <- factor(df$BedroomAbvGr)
+  df_clean$KitchenAbvGr <- factor(df$KitchenAbvGr)
+  df_clean$TotRmsAbvGrd <- factor(df$TotRmsAbvGrd)
+  df_clean$Fireplaces <- factor(df$Fireplaces)
+  df_clean$GarageCars <- factor(df$GarageCars)
+  df_clean$MoSold <- factor(df$MoSold)
+  
+  return(df_clean)
+}
+```
+
+## Function: Change any of the Quality fields into numbers. Define a transformation function
+
+For all the fields that have a word rating, we converted the answers into a numeric scale. This will both reduce the number of categorical fields and allow more interpretability in the model. The word to score translation is listed below:
+
+|Numeric Assigned | Str Encoding | Data Dictionary Description|
+|----|----|---|
+|9|Ex|Excellent|
+|7|Gd|Good|
+|5|TA|Average/Typical|
+|3|Fa|Fair|
+|1|Po|Poor|
+|0|NA|No basement|
+
+For the few of these fields that have nulls, this is intentional, the data dictionary actually defines the NA's as no basement.
+
+```{r}
+
+QualityToNumeric <- function(df){
+  
+  # setup a copy (to prevent from looping with the same variable name)
+  df_clean <- data.frame(df)
+  
+  # convert words into continuous scores
+  df_clean$GarageYrBlt <- as.numeric(df_clean$GarageYrBlt)
+  df_clean$ExterCond <- sapply(df$ExterCond, function(x) { switch(x, Ex=9, Gd=7, TA=5, Av=5, Fa=3, Po=1, "NA"=0)})
+  df_clean$ExterQual <- sapply(df$ExterQual, function(x) { switch(x, Ex=9, Gd=7, TA=5, Av=5, Fa=3, Po=1, "NA"=0)})
+  df_clean$BsmtQual <- sapply(df$BsmtQual, function(x) { switch(x, Ex=9, Gd=7, TA=5, Av=5, Fa=3, Po=1, "NA"=0)})
+  df_clean$BsmtCond <- sapply(df$BsmtCond, function(x) { switch(x, Ex=9, Gd=7, TA=5, Av=5, Fa=3, Po=1, "NA"=0)})
+  df_clean$BsmtExposure <- sapply(df$BsmtExposure, function(x) { switch(x, Gd=10, Av=7, Mn=4, No=1, "NA"=0)})
+  df_clean$BsmtFinType1 <- sapply(df$BsmtFinType1, function(x) { switch(x, GLQ=10, ALQ=7, Rec=7, BLQ=4, LwQ=1, Unf=0, "NA"=0)})
+  df_clean$BsmtFinType2 <- sapply(df$BsmtFinType2, function(x) { switch(x, GLQ=10, ALQ=7, Rec=7, BLQ=4, LwQ=1, Unf=0, "NA"=0)})
+  df_clean$HeatingQC <-sapply(df$HeatingQC, function(x) { switch(x, Ex=9, Gd=7, TA=5, Av=5, Fa=3, Po=1, "NA"=0)})
+  df_clean$KitchenQual <- sapply(df$KitchenQual, function(x) { switch(x, Ex=9, Gd=7, TA=5, Av=5, Fa=3, Po=1, "NA"=0)})
+  df_clean$Functional <- sapply(df$Functional, function(x) { switch(x, Typ=1.0, Min1=.85, Min2=.7, Mod=.55, Maj1=.45, Maj2=.3, Sev=.15, Sal=0.0)})
+  df_clean$GarageQual <- sapply(df$GarageQual, function(x) { switch(x, Ex=9, Gd=7, TA=5, Av=5, Fa=3, Po=1, "NA"=0)})
+  df_clean$GarageCond <- sapply(df$GarageQual, function(x) { switch(x, Ex=9, Gd=7, TA=5, Av=5, Fa=3, Po=1, "NA"=0)})
+  df_clean$GarageFinish <- sapply(df$GarageFinish, function(x) { switch(x, Fin=1, RFn=0.66, Unf=0.33,"NA"=0)})
+  return(df_clean)
+}
+```
+
+## Function: Imputing some of the missing values
+
+For the few fields that were left with NA's, the following strategy was used. Since most of the NA's showed up in Categorical all the NA's were replaced with new categories called "None". Based on the data dictionary the remainder were assigned default values.
+
+```{r}
+
+ImputeValues <- function(df){
+  
+  # setup a copy (to prevent from looping with the same variable name)
+  df_clean <- data.frame(df)
+  
+  df_clean[is.na(df_clean$GarageYrBlt),]$GarageYrBlt = 0
+  
+  # add levels for none
+  levels(df_clean$GarageType) = c(levels(df$GarageType),"None")
+  df_clean[is.na(df_clean$GarageType),]$GarageType <- "None" 
+  
+  # addFill nones, 0 and default values
+  df_clean[is.na(df_clean$MasVnrType),]$MasVnrType <- "None"
+  df_clean[is.na(df_clean$MasVnrArea),]$MasVnrArea <- 0
+  df_clean[is.na(df_clean$Electrical),]$Electrical <- 'SBrkr'
+  return(df_clean)
+}
+```
+
+
+## Clean all datasets - check for nulls in the clean dataset
+
+```{r}
+df_clean <- df %>% 
+  Years_to_Age %>% 
+  SwapToFactor %>% 
+  DealWithNulls %>% 
+  QualityToNumeric %>% 
+  ImputeValues
+  
+# check for nulls
+sum(is.na(df_clean))
+```
+
+
+## Sample of the Cleaned up table
+
+\small
+
+```{r}
+t(head(df_clean)) %>% kable
+```
+
+\normalsize
+
+\pagebreak
+
+#EDA:  Optional EDA Cleanup Functions
+
+## Optional - Function: swap roof materials with price per tile
+
+Basically plug in the price as the indicator:
+http://www.hgtv.com/remodel/outdoors/top-6-roofing-materials
+
+
+```{r}
+RoofMatlToDollars <- function(df){
+  # make a local copy
+  df_clean <- data.frame(df)
+  df_clean$RoofMatl <- sapply(df_clean$RoofMatl,function(x) switch(x, ClyTile=400 ,CompShg=250 ,Membran=10 ,Metal=500 ,Roll=100 ,"Tar&Grv"=100 ,WdShake=125 ,WdShngl=125))
+  return(df_clean)
+}
+
+```
+
+
+## Optional - Function: exclude dominant features (see overview below for a table)
+
+The following fields had 90% one value so were dropped as predictors for this study:
+
+- Condition2
+- Heating
+- RoofMatl
+- X3SsnPorch
+- LowQualFinSF
+- KitchenAbvGr
+- MiscVal
+- LandSlope
+- CentralAir
+- BsmtHalfBath
+- Functional
+- PavedDrive
+- Electrical
+- ScreenPorch
+- GarageQual
+- GarageCond
+- LandContour
+
+```{r}
+ExcludeFeatures_90Plus <- function(df){
+  return(df %>% select(-Condition2, -Heating, -RoofMatl, -X3SsnPorch, -LowQualFinSF, -KitchenAbvGr, -MiscVal, -LandSlope, -CentralAir, -BsmtHalfBath, -Functional, -PavedDrive, -Electrical, -ScreenPorch, -GarageQual, -LandContour))
+}
+```
+
+## Optional - Function: Remove Collinear Fields from OLS analysis
+
+These fields have been removed from tweaking and research during OLS, Lasso, or Ridge analysis.
+- TotalBsmtSF: this can be calculated from BsmtSF1 and BsmtSF2 added together
+- BldgType: this is covered more detail in the MSSubClass: Identifies the type of dwelling involved in the sale.	So this is unnecessary
+- Combining Exterior Fields, Exterior1st,Exterior2nd makes a single fields and deals with a Field1-NA case
+
+```{r}
+
+RemoveCollinear <- function(df){
+  df_clean <- data.frame(df)
+  df_clean$ExtCom <- df_clean %>% mutate(ExtCom = paste0(Exterior1st,'-', Exterior2nd)) %>% select(ExtCom) %>% unlist
+  df_clean <- df %>% select(-TotalBsmtSF, -Exterior1st, -Exterior2nd,-BldgType, -HouseStyle, -GarageCond, -SaleCondition)
+  return(df_clean)
+}
+```
+
+## Optional - Function: Convert All areas to Log Areas
+
+Based on some of the studies below:
+```{r}
+
+AreaToLogArea <- function(df){
+  df_clean <- data.frame(df)
+  df_clean$GrLivArea <- log(df$GrLivArea+1)
+  df_clean$LotArea <- log(df$LotArea+1)
+  df_clean$GarageArea <- log(df$GarageArea+1)
+  df_clean$BsmtFinSF1 <- log(df$BsmtFinSF1+1)
+  df_clean$BsmtFinSF2 <- log(df$BsmtFinSF2+1)
+  df_clean$MasVnrArea <- log(df$MasVnrArea+1)
+  df_clean$X1stFlrSF <- log(df$X1stFlrSF+1)
+  df_clean$X2ndFlrSF <- log(df$X2ndFlrSF+1)
+  df_clean$BsmtUnfSF <- log(df$BsmtUnfSF+1)
+  
+  return(df_clean)
+}
+
+AreaToLogAreaExcluded90 <- function(df){
+  df_clean <- data.frame(df)
+  df_clean$X3SsnPorch <- log(df$X3SsnPorch+1)
+  df_clean$LowQualFinSF <- log(df$LowQualFinSF+1)
+  df_clean$ScreenPorch <- log(df$ScreenPorch+1)
+  df_clean$MiscVal <- log(df$MiscVal+1)
+  df_clean$PoolArea <- log(df$PoolArea+1)
+  df_clean$WoodDeckSF <- log(df$WoodDeckSF+1)
+  df_clean$OpenPorchSF <- log(df$OpenPorchSF+1)
+  df_clean$EnclosedPorch <- log(df$EnclosedPorch+1)
+  return(df_clean)
+}
+
+```
+
+\pagebreak
+
+#EDA: Exploration of Linear relationships to LogResponse: Check other fields manually
+
+## Compare Total Rooms Above Ground
+
+We see from the plots below, that the rooms above ground level don't change much in comparison to their log versions. The inherent data is naturally linear already and do not need to be transformed
+
+```{r fig.width=7, fig.height=3}
+
+reg <- df %>% 
+  mutate(log_Saleprice = log(SalePrice)) %>% 
+  ggplot(aes(x=TotRmsAbvGrd, y=log_Saleprice)) + 
+  geom_point() +
+  labs(title='TotRmsAbvGrd')
+
+
+log <- df %>% 
+  mutate(log_Saleprice = log(SalePrice)) %>% 
+  ggplot(aes(x=log(TotRmsAbvGrd), y=log_Saleprice)) + 
+  geom_point() +
+  labs(title='Log TotRmsAbvGrd')
+
+multiplot(reg,log, cols=2)
+```
+
+
+## Compare How old the house is (Yr Built in years)
+
+We see from the plots below, similarly, the years old the house is is loosely already linear to log sale price and does not need to be transformed.
+
+```{r fig.width=7, fig.height=3}
+
+reg <- df %>% 
+  mutate(log_Saleprice = log(SalePrice)) %>% 
+  ggplot(aes(x=YearBuilt, y=log_Saleprice)) + 
+  geom_point() +
+  labs(title='YearBuilt')
+
+
+log <- df %>% 
+  mutate(log_Saleprice = log(SalePrice)) %>% 
+  ggplot(aes(x=log(YearBuilt), y=log_Saleprice)) + 
+  geom_point() +
+  labs(title='Log YearBuilt')
+
+multiplot(reg,log, cols=2)
+```
+
+## Compare Garage Area 
+
+We look at garage area to see if log Area will be more closely linearly related to log price, and we see the shape straighten and spread out
+
+```{r fig.width=7, fig.height=3}
+
+reg <- df %>% 
+  mutate(log_Saleprice = log(SalePrice)) %>% 
+  ggplot(aes(x=GarageArea, y=log_Saleprice)) + 
+  geom_point() +
+  labs(title='GarageArea')
+
+
+log <- df %>% 
+  mutate(log_Saleprice = log(SalePrice)) %>% 
+  ggplot(aes(x=log(GarageArea), y=log_Saleprice)) + 
+  geom_point() +
+  labs(title='Log GarageArea')
+
+multiplot(reg,log, cols=2)
+```
+
+## Compare first floor Square Footage
+
+As verification we look at first floor area to see if log Area will be more closely linearly related to log price, and we see the shape straighten and spread out. As a result, we will convert all area metrics into log versions of them to have a better linear relationship with the log price.
+
+```{r fig.width=7, fig.height=3}
+
+reg <- df %>% 
+  mutate(log_Saleprice = log(SalePrice)) %>% 
+  ggplot(aes(x=X1stFlrSF, y=log_Saleprice)) + 
+  geom_point() +
+  labs(title='X1stFlrSF')
+
+
+log <- df %>% 
+  mutate(log_Saleprice = log(SalePrice)) %>% 
+  ggplot(aes(x=log(X1stFlrSF), y=log_Saleprice)) + 
+  geom_point() +
+  labs(title='Log X1stFlrSF')
+
+multiplot(reg,log, cols=2)
+```
+
+
+
+\pagebreak
+
+#EDA: Outlier Analysis
+
+```{r}
+
+# setup the fit model
+y_log <- df_clean$SalePrice %>% log %>% unlist
+X <- df_clean %>% select (-SalePrice,-Id)
+fit <- lm(y_log ~., X)
+```
+
+
+
+## Influence Plot
+
+From running a quick influence plot, we see a good number of outlier points with high influence (large circles). From the plot, there's approximately 30+ points that are outside of the criteria (horizontal lines)
+
+```{r fig.width=7, fig.height=4}
+# Influence Plot
+influencePlot(fit,	id.method="identify", main="Influence Plot", sub="Circle size is proportial to Cook's Distance" )
+```
+
+## Function: Using DFFITS to Exclude Points
+
+Will use the rule $$ 2\sqrt{\frac{p}{n}} $$ < DFFITS. To exclude points
+
+```{r}
+df_clean <-df %>% 
+  Years_to_Age %>% 
+  SwapToFactor %>% 
+  DealWithNulls %>% 
+  QualityToNumeric %>% 
+  ImputeValues %>% 
+  RoofMatlToDollars %>% 
+  RemoveCollinear %>% 
+  #ExcludeFeatures_90Plus %>%  # this was to improve the score  
+  AreaToLogArea %>% 
+  AreaToLogAreaExcluded90
+
+Exclude_Outliers <- function(df_clean){
+
+  # pull out OLS variables (will use all of them at the moment)
+  y_log <- df_clean$SalePrice %>% log %>% unlist
+  X <- df_clean %>% select (-SalePrice,-Id)
+  
+  # fit the model
+  fit <- lm(y_log ~., X)
+  
+  # Set a general cut off parametner
+  # 2 sqrt(p/n)
+  y_log <- df_clean$SalePrice %>% log %>% unlist
+  X <- df_clean %>% select (-SalePrice,-Id)
+  fit_dffits<- ols_dffits_plot(lm(y_log ~., X))
+  
+  # conservatively leave the NA's in
+  points_to_exclude_by_id <- fit_dffits$outliers$Observation
+  
+  # find hte points to keep
+  points_to_keep <- setdiff(1:nrow(df_clean), points_to_exclude_by_id)
+  
+  # dplyr to filter for those points to keep
+  return(df_clean %>% filter(Id %in% points_to_keep))
+}
+
+# Sample
+z <- Exclude_Outliers(df_clean)
+
+```
+
+\pagebreak
+
+#EDA: Export to Disk for others to use:
+
+```{r fig.show="hide"}
+df_clean <- df %>% 
+  Years_to_Age %>% 
+  SwapToFactor %>% 
+  DealWithNulls %>% 
+  QualityToNumeric %>% 
+  ImputeValues %>% 
+  RoofMatlToDollars %>% 
+  RemoveCollinear %>% 
+  Exclude_Outliers
+
+df %>% 
+  Years_to_Age %>% 
+  SwapToFactor %>% 
+  DealWithNulls %>% 
+  QualityToNumeric %>% 
+  ImputeValues %>% 
+  RoofMatlToDollars %>%
+  RemoveCollinear %>%   
+  ExcludeFeatures_90Plus %>%   
+  Exclude_Outliers %>% 
+  write.csv('~/Documents/MSAN/04-601-LinRegression/Project/clean_dataframe.csv')
+
+```
+
+\pagebreak
+
+#EDA: Function: Value counts within each field
+
+This table is a mini histogram per field, it lists the top values, how often they show up and what % of the total field they occupy. These are used for identifying fields over 90% dominated by a single value.
+
+```{r}
+
+get_df_stats <- function(df){
+  # get statistics
+  rows <- nrow(df)
+  colno <- ncol(df)
+  colnames <- names(df)
+  all_headings <- list()
+  all_outputs <- list()
+  null_pct <- list()
+  
+  # loop through each column
+  for (i in 1:colno){
+    
+    # store the headings
+    all_headings[[i]] <- colnames[i]
+    
+    # make the histogram for one field
+    histo <- df %>% 
+      select(paste(colnames[i])) %>% 
+      group_by_at(colnames[i]) %>% 
+      count %>% 
+      arrange(desc(n)) %>% 
+      head(3)
+    
+    output <- ''
+    
+    # then order it and concatente the info
+    # on a single line wiht % and #
+    for (j in 1:nrow(histo)){
+      
+      value <- histo[[j,colnames[i]]]
+      value_count <- histo[[j,'n']]
+      value_count_pct <- round(histo[j,'n']/rows,2)*100
+      
+      
+      null_pct[[i]] <- df %>% 
+        select(paste(colnames[i])) %>% 
+        is.na %>%  
+        sum()*1.0 / rows %>% 
+        round(2)*100
+      
+      # assemble the string output
+      output <- paste0(output,
+                       '(',value_count_pct,'%, --',value,'--,', value_count,'# )', 
+                       sep=' ', 
+                       collapse = ' ')
+    }
+    
+    # add the completed string
+    all_outputs[[i]] <- output
+  }
+  return(list(all_headings, all_outputs, null_pct))
+}
+
+clean_stats <- get_df_stats(df_clean)
+  
+# create a data table summary
+summary <- data.frame(headings = unlist(clean_stats[[1]]), 
+                      top_hist_values=unlist(clean_stats[[2]]), 
+                      null_pcts=unlist(clean_stats[[3]]))
+# format for print
+summary %>% arrange(desc(top_hist_values)) %>% head(30) %>% kable
+```
+
+
+
+\pagebreak
+
+\pagebreak
+
+# OLS: Linear Model Building
+
+## Load clean data
+
+Will clean the dataframe with all the same functions outlined in the EDA section.
+
+```{r fig.show="hide"}
+df <- read.csv('~/Documents/MSAN/04-601-LinRegression/Project/housing.txt', stringsAsFactors = FALSE)
+
+df_clean <-df %>% 
+  Years_to_Age %>% 
+  SwapToFactor %>% 
+  DealWithNulls %>% 
+  QualityToNumeric %>% 
+  ImputeValues %>% 
+  RoofMatlToDollars %>% 
+  RemoveCollinear %>% 
+  #ExcludeFeatures_90Plus %>%  # this was to improve the score  
+  AreaToLogArea %>% 
+  AreaToLogAreaExcluded90 %>% 
+  Exclude_Outliers
+
+
+
+```
+
+## Define the X by including all fields
+
+Define our X features by all the fields, except the response variable
+```{r}
+X_OLS_all <- df_clean %>% select(-SalePrice, -Id)
+```
+
+## As discussed in EDA, will set our target Response Y to Log(SalePrice)
+```{r fig.width=5, fig.height=3}
+y_OLS <- df_clean %>% select(SalePrice) %>% unlist %>% as.numeric
+y_OLS_log <- log(y_OLS)
+```
+
+#OLS: Fit the OLS Model - All Fields (After EDA processing)
+
+```{r}
+# fit model
+fit_model <- lm(y_OLS_log ~., X_OLS_all)
+
+# interpolate the values y_hat
+y_hat_log <- predict(lm(y_OLS_log ~., X_OLS_all), X_OLS_all, se.fit = TRUE)[[1]]
+```
+
+## R-squared and MSE
+
+```{r}
+print(summary(fit_model)$r.squared)
+# calculate MSE
+Log_MSE <- mean((y_hat_log - y_OLS_log)^2)
+print(Log_MSE)
+
+MSE <- mean((exp(y_hat_log) - exp(y_OLS_log))^2)
+print(MSE)
+print(sqrt(MSE))
+
+
+```
+
+## Plot Y_predicted by Y_hat
+```{r fig.width=7, fig.heigh=3}
+# plot the result of y_hat vs. y_orig
+p1<- data.frame(y_hat=y_hat_log, y_OLS=y_OLS_log) %>% 
+  ggplot(aes(x=y_hat, y=y_OLS)) + 
+  geom_point()+ 
+  geom_point(aes(x=y_hat, y=y_hat), color='red')+
+  labs(x= "Y Predicted (Log Sale Price)", y = "Y True (Log Sale Price)", title="OLS Linear Regression of Log Sales Price")
+
+p2<- data.frame(y_hat=exp(y_hat_log), y_OLS=exp(y_OLS_log)) %>% 
+  ggplot(aes(x=y_hat, y=y_OLS)) + 
+  geom_point()+ 
+  geom_point(aes(x=y_hat, y=y_hat), color='red')+
+  labs(x= "Y Predicted (Sale Price)", y = "Y True (Sale Price)", title="OLS Linear Regression of Sales Price")
+
+multiplot(p1,p2, cols=2)
+```
+
+\pagebreak
+
+#OLS:  Normality of Errors
+
+## Plot: Residuals vs. Response
+
+```{r fig.width=7, fig.height=3}
+residuals <- y_hat_log - y_OLS_log
+
+p1<- data.frame(y_OLS_log, residuals) %>% 
+  ggplot(aes(x=y_OLS_log,y=residuals)) + geom_point() + labs(x='Log Sale Price', y='Residuals (y_hat - y_true)', title='Residuals Scatter Plot (of the Logs)')
+
+p2<- data.frame(y_OLS=exp(y_hat_log), residuals=(exp(y_hat_log) - exp(y_OLS_log))) %>% 
+  ggplot(aes(x=y_OLS,y=residuals)) + geom_point() + labs(x='Sale Price', y='Residuals (y_hat - y_true)', title='Residuals Scatter Plot (Non-Transformed)')
+
+multiplot(p1,p2, cols=2)
+```
+
+## Plot: Distribution of the Residuals (Normalized)
+
+```{r fig.width=7, fig.height=3}
+residuals_norm <- (residuals-mean(residuals))/sd(residuals)
+data.frame(residuals_norm=residuals_norm) %>% ggplot(aes(x=residuals_norm)) + geom_histogram(bins=40) + labs(x='residuals (Normed)', y='Count', title='Distribution of Residuals (y_hat - y_true)')
+```
+
+
+## K-S Test of the Residuals
+```{r}
+n_resid <- length(residuals_norm)
+std_norm <- rnorm(n = n_resid,mean = 0, sd = 1 )
+
+print(ks.test(residuals_norm,std_norm))
+```
+
+#OLS: Significant Factors
+
+## Signficant Features Pr (<0.05), then ordered by Beta Magnitude
+```{r}
+OLS_results_df <- data.frame(summary(fit_model)$coefficients)
+colnames(OLS_results_df) <- c('Beta_est','StdErr','t_val','Pr')
+OLS_results_df$names <- labels(OLS_results_df)[[1]]
+OLS_results_df %>% 
+  filter(Pr<0.05) %>% 
+  arrange(desc(abs(Beta_est))) %>% 
+  mutate(ct=rownames(.)) %>% 
+  kable(digits=c(3,3,3,3))
+```
+
+\pagebreak
+
+--- 
+
+# Discussion of Dominant OLS Factors:
+
+The following section will look at some of the dominant features found in the OLS analysis and will do plots vs. Sale Price to verify the strong signal
+
+## Strong Beta: Comparison of Price vs. Zoning
+
+- A	Agriculture
+- C	Commercial
+- FV	Floating Village Residential
+- I	Industrial
+- RH	Residential High Density
+- RL	Residential Low Density
+- RP	Residential Low Density Park 
+- RM	Residential Medium Density
+
+```{r fig.width=7, fig.height=4}
+p1 <- df_clean %>% 
+  select(SalePrice, MSZoning) %>%
+  ggplot(aes(x=MSZoning, y=SalePrice)) + 
+  geom_violin() +
+  labs(title = 'Sale Price vs. MSZone')
+
+p2 <- df_clean %>% 
+  select(SalePrice, MSZoning) %>%
+  ggplot(aes(x=MSZoning, y=log(SalePrice))) + 
+  geom_violin() +
+  labs(title = 'Log Sale Price vs. MSZone')
+
+multiplot(p1,p2, cols=2)
+```
+
+## Strong Beta: Comparison of Price Garage Type
+
+- 2Types	More than one type of garage
+- Attchd	Attached to home
+- Basment	Basement Garage
+- BuiltIn	Built-In (Garage part of house - typically has room above garage)
+- CarPort	Car Port
+- Detchd	Detached from home
+- NA	No Garage
+
+```{r fig.width=7, fig.height=4}
+p1 <- df_clean %>% 
+  select(SalePrice, GarageType) %>%
+  ggplot(aes(x=GarageType, y=SalePrice)) + 
+  geom_violin() +
+  labs(title = 'Sale Price vs. MSZone')
+
+p2 <- df_clean %>% 
+  select(SalePrice, GarageType) %>%
+  ggplot(aes(x=GarageType, y=log(SalePrice))) + 
+  geom_violin() +
+  labs(title = 'Log Sale Price vs. MSZone')
+
+multiplot(p1,p2, cols=2)
+```
+
+## Strong Beta: Lot Configuration
+
+- Inside	Inside lot
+- Corner	Corner lot
+- CulDSac	Cul-de-sac
+- FR2	Frontage on 2 sides of property
+- FR3	Frontage on 3 sides of property
+
+```{r fig.width=7, fig.height=4}
+p1 <- df_clean %>% 
+  select(LotConfig, SalePrice) %>%
+  ggplot(aes(x=LotConfig, y=SalePrice)) + 
+  geom_violin() +
+  labs(title = 'Sale Price vs. LotConfig')
+
+p2 <- df_clean %>% 
+  select(SalePrice,LotConfig ) %>%
+  ggplot(aes(x=LotConfig, y=log(SalePrice))) + 
+  geom_violin() +
+  labs(title = 'Log Sale Price vs. LotConfig')
+
+multiplot(p1,p2, cols=2)
+```
+
+## Comparison of General Living Area vs. Price
+
+
+```{r fig.width=7, fig.height=4}
+p1 <- df_clean %>% 
+  select(SalePrice, GrLivArea) %>%
+  ggplot(aes(x=GrLivArea, y=SalePrice)) + 
+  geom_point() +
+  labs(title = 'Sale Price vs. General Living Area')
+
+p2 <- df_clean %>% 
+  select(SalePrice, GrLivArea) %>%
+  ggplot(aes(x=log(GrLivArea), y=log(SalePrice))) + 
+  geom_point() +
+  labs(title = 'Log Sale Price vs. General Living Area')
+
+multiplot(p1,p2, cols=2)
+```
+
+
+## Comparison of Lot Area vs. Price
+
+```{r fig.width=7, fig.height=4}
+p1 <- df_clean %>% 
+  select(SalePrice, LotArea) %>%
+  ggplot(aes(x=LotArea, y=SalePrice)) + 
+  geom_point() +
+  labs(title = 'Sale Price vs. General Living Area')
+
+p2 <- df_clean %>% 
+  select(SalePrice, LotArea) %>%
+  ggplot(aes(x=log(LotArea), y=log(SalePrice))) + 
+  geom_point() +
+  labs(title = 'Log Sale Price vs. Lot Area')
+
+multiplot(p1,p2, cols=2)
+```
+
+
+## Comparison of Overall Quality vs. Price
+
+```{r fig.width=7, fig.height=4}
+p1 <- df_clean %>% 
+  select(SalePrice, OverallQual) %>%
+  ggplot(aes(x=OverallQual, y=SalePrice)) + 
+  geom_jitter()+
+  labs(title = 'Sale Price vs. Overall Quality')
+
+p2 <- df_clean %>% 
+  select(SalePrice, OverallQual) %>%
+  ggplot(aes(x=OverallQual, y=log(SalePrice))) + 
+  geom_jitter() +
+  labs(title = 'Sale Price vs. Overall Quality')
+
+multiplot(p1,p2, cols=2)
+```
+
+```{r }
+df_clean %>% 
+  select(SalePrice, LotArea, GrLivArea) %>%
+  ggplot(aes(x=GrLivArea, y=LotArea,size=SalePrice) ) + 
+  geom_hline(yintercept = mean(df_clean$LotArea), color='red') +
+  geom_vline(xintercept = mean(df_clean$GrLivArea), color='red') +
+  geom_point()+
+  labs(title = 'General Living Area vs. LotArea, Sale Price = Size')
+```
+
+
+--- 
+
+# OLS: Cosine Similiarity of Morty to Other Houses
+
+```{r fig.show="hide", include=FALSE}
+x_new <- 
+  read.csv('Morty.txt', stringsAsFactors = F) %>% 
+  select(-X) # Make sure pathname here is right
+
+x_clean <- x_new %>% 
+  Years_to_Age %>% 
+  DealWithNulls %>% 
+  SwapToFactor %>% 
+  QualityToNumeric %>% 
+  RoofMatlToDollars %>% 
+  RemoveCollinear %>% 
+  #ExcludeFeatures_90Plus %>%  # this was to improve the score  
+  AreaToLogArea %>% 
+  AreaToLogAreaExcluded90 %>% select(-Id,-SalePrice)
+```
+
+```{r}
+
+# Bind together
+y_OLS_hat <- predict(fit_model, X_OLS_all)
+
+# Convert to dummy variables + model matrix
+proxy_matrix <- model.matrix(SalePrice~.,df_clean %>% select(-Id))
+
+# Pull morty's vector out
+target_vec <- proxy_matrix[5,] 
+
+# The remaining houses will be compared to
+compar_vecs <-proxy_matrix
+rows <- nrow(compar_vecs)
+
+```
+
+## Loop through and compare against all other houses
+
+```{r}
+# Calculate all teh scores
+scores <- list()
+for (i in 1:rows){
+  #scores[[i]] <- cosine.similarity(target_vec, compar_vecs[i,], .do.norm=T)
+  scores[[i]] <- target_vec %*% compar_vecs[i,] / norm(target_vec,type="2") / norm(compar_vecs[i,],type="2")
+}
+```
+
+
+## Rebuild the data frame with predicted prices + morty's house. Sort by cosine similarity
+
+```{r cache=F}
+x_clean$Id <- 9999
+x_clean$SalePrice <- 143000
+
+close_5 <- df_clean%>% 
+  mutate(OLS_price = exp(y_OLS_hat)) %>% 
+  mutate(proxy_score = unlist(scores)) %>% 
+  bind_rows(x_clean) %>% 
+  arrange(desc(proxy_score)) %>% head(6) 
+```
+
+## Show Similar Houses
+
+\small
+
+```{r cache=F}
+t(close_5) %>% kable
+```
+
+```{r include=FALSE}
+# for exporting for business report
+to_out<- t(close_5) %>% data.frame
+to_out$rownames <- row.names(to_out)
+to_out %>% write.csv('similarhouses.csv')
+```
+
+\normalsize
+
+\pagebreak
+
+# OLS: Explanatory Modeling: Part II
+
+We are given a new set of features, Morty's house. We now clean this in the same way to put into our model:
+```{r}
+# Make sure this pipeline is still up to date
+x_new <- 
+  read.csv('Morty.txt', stringsAsFactors = F) %>% 
+  select(-X) # Make sure pathname here is right
+
+x_clean <- x_new %>% 
+  Years_to_Age %>% 
+  DealWithNulls %>% 
+  SwapToFactor %>% 
+  QualityToNumeric %>% 
+  RoofMatlToDollars %>% 
+  RemoveCollinear %>% 
+  #ExcludeFeatures_90Plus %>%  # this was to improve the score  
+  AreaToLogArea %>% 
+  AreaToLogAreaExcluded90 %>% select(-Id,-SalePrice)
+```
+
+## Confidence interval of Morty's House Price
+Our first task is to predict the value, so let's explore the 95% CI given by our model:
+```{r}
+fit_model <- lm(y_OLS_log~., df_clean %>% select(-Id,-SalePrice))
+log_y <- predict(fit_model, x_clean, interval = 'predict', level = 0.95)
+(y <- exp(log_y))
+```
+We find a fitted value of \$ `r y[1,1]`, with a 95% CI of (\$ `r y[1,2]`, \$ `r y[1,3]`). As such, we conclude the maximise value we can reasonably expect the house to sell for is \$ `r y[1,3]`.
+
+Note that this analysis relies solely on unbiased OLS estimators. Our predicted range is wide, but the needed for an unbiased estimator in order to construct a CI necessitates the use of OLS for our estimation.
+
+# Key Factors
+
+##Assessing key factors to change:
+
+First, let's just have a look at the coefficients we've got in our model:
+
+\small
+
+```{r}
+summary(fit_model)
+```
+
+\normalsize
+
+Now let's make some ground rules for how we're going to search:  
+- A lot of features will be excluded immediately because they're not under our control (e.g. district of the house)  
+- Our OLS analysis deals with correlation, and so we have no information as to causation. As such, we will try to safeguard our suggestions with the highest of significance levels and cross check this with common sense.  
+- For the reason above, we'll look for fields that will add maximum value for minimum expense, to avoid unnecessary costs for Morty.
+
+Given that we're most concerned by the significance of our coefficients, let's rank by the SL and exclude any not significant at 95% level:
+```{r}
+significant_fields <- NULL
+coeffs <- NULL
+SL <- NULL
+for(i in 1:135){
+  if(summary(fit_model)$coefficients[i,4] < 0.05){
+    significant_fields <- c(significant_fields, row.names(summary(fit_model)$coefficients)[i])
+    coeffs <- c(coeffs, summary(fit_model)$coefficients[i,1])
+    SL <- c(SL, summary(fit_model)$coefficients[i,4])
+  }
+}
+(sig_fields_df <- data.frame(field = significant_fields, beta = coeffs, SL = SL) %>% arrange(SL))
+```
+
+Our process now will be to start with the most significant variables - search to find ones which we may be able to change on short notice, and then see how Morty's property compares to average values:
+
+Evaluating categories we think we may be able to change:
+
+##1. Fireplaces
+
+```{r}
+(Morty_Fireplaces <- x_clean$Fireplaces)
+(avg_Fireplaces <- mean(df_clean$Fireplaces))
+```
+
+Morty has a below average number of fireplaces (0), so adding an electrical fireplace may give his house an added boost if appropriate.
+
+**Adding an electrical fireplace may boost the appeal of Morty's house.**
+
+##2. Half-Bathrooms:
+
+
+```{r}
+(Morty_HalfBath <- x_clean$HalfBath)
+(avg_HalfBath <- mean(df_clean$HalfBath))
+```
+
+Morty's already above average on this metric though, so likely isn't going to be helped by creating more half-bathrooms.
+
+##3. Garage Cars:
+```{r}
+(Morty_GarageCars <- x_clean$GarageCars)
+(avg_GarageCars <- mean(df_clean$GarageCars))
+```
+
+Above average on this one too so unlikely to help by adding garage capacity.
+
+##4. Heating Quality and Condition:
+
+```{r}
+(Morty_HeatingQC <- x_clean$HeatingQC)
+(avg_HeatingQC <- mean(df_clean$HeatingQC))
+```
+
+Likewise, Morty already has excellent heating quality and condition.
+
+##5. Kitchen Quality:
+
+```{r}
+(Morty_Kitchen <- x_clean$KitchenQual)
+(avg_Kitchen <- mean(df_clean$KitchenQual))
+```
+
+**Kitchen Quality - could be improved on to bring up to average.**
+
+##6. Garage Finish:
+
+```{r}
+(Morty_GarageFinish <- x_clean$GarageFinish)
+(avg_GarageFinish <- mean(df_clean$GarageFinish))
+```
+
+**Morty has below average garage finish, and we would think this is an easy thing to improve on.**
+
+\pagebreak
+
+---
+
+#OLS: Summary
+
+These are the only variables we can spot that are significant at 95% level that can be easily adapted. As such, we only have a list of 3 which we think can reasonably be improved upon:  
+1. Adding electrical fireplace  
+2. Improving kitchen quality  
+3. Improving garage finish.
+
+If, we impute the mean values for these metrics (and add a single fireplace) and recalculate the prediction interval:
+```{r}
+x_update <- x_clean
+x_update$KitchenQual <- mean(df_clean$KitchenQual)
+x_update$GarageFinish <- mean(df_clean$GarageFinish)
+x_update$Fireplaces <- 1
+log_y_update <- predict(fit_model, x_update, interval = 'predict', level = 0.95)
+(y <- exp(log_y_update))
+```
+
+Finally, we summarise all of the above information in one table:
+```{r}
+model_params <- sig_fields_df %>% filter(field == 'Fireplaces' | field == 'KitchenQual' | field == 'GarageFinish')
+Morty_values <- data.frame(Morty = as.numeric(c(x_clean['Fireplaces'], x_clean['KitchenQual'], x_clean['GarageFinish'])))
+Mean_values <- data.frame(Mean = as.numeric(c(mean(df_clean$Fireplaces), mean(df_clean$KitchenQual), mean(df_clean$GarageFinish))))
+summary_data <- cbind(model_params, Morty_values, Mean_values)
+summary_data$exp_beta <- exp(summary_data$beta)
+kable(summary_data)
+```
+
+
+Note that the final column in this table, the exponent of the coefficient, represents the approximate factor that value would increase if we were to increment the corresponding feature value by 1 unit.
+
+\pagebreak
+
+# Pred: Predictive Analysis
+
+
+```{r include=F}
+# rm(list=ls())            # removes all objects from the environment
+# cat("\014")              # clears the console
+# library(tidyverse)
+# library(magrittr)
+# library(glmnet)
+# select <- dplyr::select
+# source('Part2-case_study_common_funcs.R')
+
+```
+
+## Predictive modeling - Data Prep
+
+
+
+```{r}
+clean <- function(df){
+     housing <- df
+     
+     pct_na <- sapply(housing, function(x) round((sum(is.na(x)) / length(x))*100))
+     housing <- housing[,pct_na < 80]
+     
+     max_pct <- sapply(housing, function(x) round(max((table(x)/length(x))*100)))
+     housing <- housing[,max_pct<90]
+     
+     housing$GarageYrBlt <- sapply(housing$GarageYrBlt, function(x) (as.integer(x) %/% 10) *10)
+     housing$GarageYrBlt <- paste0(as.character(housing$GarageYrBlt), 's')
+     
+     housing$GarageYrBlt[is.na(housing$GarageYrBlt)] <- "None"
+     housing$GarageType[is.na(housing$GarageType)] <- "None"
+     housing$GarageFinish[is.na(housing$GarageFinish)] <- "None"
+     housing$MasVnrType[is.na(housing$MasVnrType)] <- 'None'
+     housing$BsmtQual[is.na(housing$BsmtQual)] <- 'None'
+     housing$BsmtExposure[is.na(housing$BsmtExposure)] <- "None"
+     housing$BsmtFinType1[is.na(housing$BsmtFinType1)] <- 'None'
+     housing$BsmtFinType2[is.na(housing$BsmtFinType2)] <- "None"
+     housing$FireplaceQu[is.na(housing$FireplaceQu)] <- "None"
+     
+     housing$MasVnrArea[is.na(housing$MasVnrArea)] <- 0
+     housing$LotFrontage[is.na(housing$LotFrontage)] <- 0
+     
+     housing$MSSubClass <- factor(housing$MSSubClass, levels = c(20,30, 40, 45, 50, 
+                                                                 60, 70, 75, 80, 85, 
+                                                                 90, 120, 150, 160, 
+                                                                 180, 190), 
+                                  labels = c('1-STORY 1946 & NEWER ALL STYLES',
+                                             '1-STORY 1945 & OLDER',
+                                             '1-STORY W/FINISHED ATTIC ALL AGES',
+                                             '1-1/2 STORY - UNFINISHED ALL AGES',
+                                             '1-1/2 STORY FINISHED ALL AGES',
+                                             '2-STORY 1946 & NEWER',
+                                             '2-STORY 1945 & OLDER',
+                                             '2-1/2 STORY ALL AGES',
+                                             'SPLIT OR MULTI-LEVEL',
+                                             'SPLIT FOYER','DUPLEX - ALL STYLES AND AGES',
+                                             '1-STORY PUD (Planned Unit Development) - 1946 & NEWER',
+                                             '1-1/2 STORY PUD - ALL AGES',
+                                             '2-STORY PUD - 1946 & NEWER',
+                                             'PUD - MULTILEVEL - INCLSPLIT LEV/FOYER',
+                                             '2 FAMILY CONVERSION - ALL STYLES AND AGES'))
+     
+     cleaner <-
+          housing %>% 
+          select(-Id)
+     
+     return(cleaner)
+}
+```
+
+## Predictive modeling - Test Train Split for Model Fitting
+
+20% of the entire data was held out for MSPE purposes. This is accomplished with the sample function that will randomly pull id's used for filtering. 
+
+```{r}
+housing <- read.csv('housing.txt', stringsAsFactors = F)
+
+housing <- clean(housing)
+
+train <- sample(1:nrow(housing), nrow(housing) *(4/5))
+test <- (-train)
+
+x <- model.matrix(SalePrice ~ ., data = housing)
+y <- housing$SalePrice
+grid.lambda <- 10^seq(10, -2, length.out = 100)
+
+y.train <- y[train]
+y.test <- y[test]
+x.train <- x[train,]
+x.test <- x[test,]
+```
+
+
+## Ridge Modeling
+
+The ridge regularized regression was used as a possible model. Due to the high number of features and often redundant data, there could be a high level of collinearity between different fields. As mentioned previously, total area in square feet is redundant if all the parts are found in the data. For example, the MSSubClass is really a mashup of the year, and the number of levels of the house. The ridge should automatically minimize the impact of these redundant features on the predictive model.
+
+```{r}
+# do a grid search of lambdas for optimal value
+model.ridge.train <- glmnet(x.train, y.train, alpha = 0, lambda = grid.lambda)
+set.seed(101)
+cv.ridge.out <- cv.glmnet(x.train, y.train, alpha = 0, type.measure = 'mse')
+best.lambda.ridge <- cv.ridge.out$lambda.min
+
+# do predictions
+ridge.pred <- predict(model.ridge.train, s = best.lambda.ridge, newx = x.test)
+
+# calculate error
+mspe.ridge <- mean((ridge.pred - y.test)^2)
+model.ridge.final <- glmnet(x, y, alpha = 0, lambda = best.lambda.ridge)
+ridge.coefs <- coef(model.ridge.final)[-2,]
+r.squared.ridge <- max(model.ridge.final$dev.ratio)
+```
+
+## Lasso Modeling
+
+Lasso modeling was also applied against the dataset. This was ideal because we suspect that over 80+ features, there are probably a large number of features that do not have an affect on sales price. Things such as paved roads, or electrical breakers will most likely have little effect. Instead of plotting each of these fields against the main response variable SalePrice, we will apply a Lasso Regularized model which will drop some of these unnecessary variables. 
+
+```{r}
+# do a grid search of lambdas for optimal value
+model.lasso.train <- glmnet(x.train, y.train, alpha = 1, lambda = grid.lambda)
+set.seed(101)
+cv.lasso.out <- cv.glmnet(x.train, y.train, alpha = 1, type.measure = 'mse')
+best.lambda.lasso <- cv.lasso.out$lambda.min
+
+# do predictions
+lasso.pred <- predict(model.lasso.train, s = best.lambda.lasso, newx = x.test)
+
+# calculate error
+mspe.lasso <- mean((lasso.pred - y.test)^2)
+model.lasso.final <- glmnet(x, y, alpha = 1, lambda = best.lambda.lasso)
+lasso.coefs <- coef(model.lasso.final)[-2,]
+r.squared.lasso <- max(model.lasso.final$dev.ratio)
+```
+
+## ElasticNet Modeling
+
+ElasticNet was also used, which has both regularization terms from both Ridge and Lasso, with an alpha blend factor. The model that was tried here was with alpha = 0.5
+
+```{r}
+# do a grid search of lambdas for optimal value
+model.en.train <- glmnet(x.train, y.train, alpha = 0.5, lambda = grid.lambda)
+set.seed(101)
+cv.en.out <- cv.glmnet(x.train, y.train, alpha = 0.5, type.measure = 'mse')
+best.lambda.en <- cv.en.out$lambda.min
+
+# do predictions
+en.pred <- predict(model.en.train, s = best.lambda.en, newx = x.test)
+
+# calculate error
+mspe.en <- mean((en.pred - y.test)^2)
+model.en.final <- glmnet(x, y, alpha = 0.5, lambda = best.lambda.en)
+en.coefs <- coef(model.en.final)[-2,]
+r.squared.en <- max(model.en.final$dev.ratio)
+```
+
+## OLS Modeling informed by lasso model 
+
+OLS was re-run again, only pulling features that were selected after running the Lasso model. This was used as a baseline score to compare the other models against.
+
+```{r}
+# ols defined by lasso variables
+ols.vars <- names(abs(lasso.coefs) > 0)
+
+# ols defined by lasso variables
+x.ols <- x[, abs(lasso.coefs) > 0]
+
+# ols test train split
+x.ols.train <- x.ols[train,]
+x.ols.test <- x.ols[test,]
+
+# run the model
+model.ols.train <- lm(y.train ~ x.ols.train)
+set.seed(101)
+ols.pred <- predict(model.ols.train, newx = x.ols.test)
+mspe.ols <- mean((ols.pred - y.test)^2)
+r.squared.ols <- summary(model.ols.train)$r.squared
+
+```
+
+
+```{r}
+Coefficients <- data.frame(Ridge = ridge.coefs, Lasso = lasso.coefs, Elastic.Net = en.coefs)
+
+MSPE_frame <- data.frame(model=c('Ridge','Lasso','Elastic.net', 'OLS'), 
+                         MSPEscores= c(mspe.ridge, mspe.lasso, mspe.en, mspe.ols),
+                         r.squared = c(r.squared.ridge, r.squared.lasso, r.squared.en, r.squared.ols),
+                         best.lambda = c(best.lambda.ridge, best.lambda.lasso, best.lambda.en, 0)
+                         ) %>% mutate(RMSPE = sqrt(MSPEscores))
+MSPE_frame %>% kable
+```
+
+
+## Regularized Prediction Discussion:
+
+Task 2: Predictive Modeling
+
+Here, we employed a handful of modeling techniques, iteratively testing out how well they performed as measured by the mean squared prediction error on a set of hold out data. Parameters for the models considered were generated via OLS, Ridge, LASSO, and Elastic Net algorithms. Besides sharing the same model type as explanatory modeling, extrapolation was markedly different in the following ways:
+
+Normality Conditions: When optimizing our model for explanation, we used a number of functions to clean and alter the data in order to reduce bias and meet several assumptions when performing regression.  When optimizing our model for prediction, however, we relaxed these assumptions to focus our concerns on prediction performance. Since we were only focused on the closeness of our predictions, our main criterion for selecting our best regression model was minimizing MSPE.  
+
+Variable Selection: To do this, we took raw data and tested out different subsets of our earlier data cleaning functions. Some of the steps taken in the variable selection for interpolation could not be omitted, such as cleaning up any null values, imputing values where necessary, and changing qualitative variables to numeric variables. For the other cleaning procedures, such as translating the year a house was built to age or removing collinear variables, we exhausted all combinations to create "partially clean" datasets.
+
+Parameter Selection: With the data cleaned, we then ran several iterations of OLS, Ridge, LASSO, and Elastic Net on these variables to find the parameter estimates whose model had the lowest MSPE. After much consideration, we finally settled on a model with parameter estimates generated by L1 norm penalized regression (Lasso). Despite the fact that the table below has Lasso listed as having the highest MSPE, when averaged out, Lasso actually had the lowest mean MSPE. It also proved to be useful for decisive variable selection. The model in all its glory is detailed in this report
+
+```{r}
+lasso_plot <- data.frame(y_hat=lasso.pred, true_sale_price = y.test) 
+colnames(lasso_plot) <- c('lasso_predictions','true_sale_price')
+lasso_plot %>% ggplot(aes(x=lasso_predictions, y=true_sale_price)) + 
+  geom_point() +
+  geom_point(aes(x=lasso_predictions, y=lasso_predictions), color='red') +
+  labs(x= "Y Predicted (Sale Price)", y = "Y True (Sale Price)", title="Lasso Regression of Sales Price")+
+  theme(axis.text.x = element_text(size=9), axis.text.y = element_text(size=9))+ theme(plot.title = element_text(size=11)) + theme(axis.text = element_text(size=11))
+```
+
+### Appendix: Optimal Lasso Beta Values
+```{r}
+lasso.coefs.ordered <- lasso.coefs[order(abs(lasso.coefs), decreasing = T)]
+lasso.coefs.ordered <- lasso.coefs.ordered[lasso.coefs.ordered != 0]
+lasso.coefs.ordered %>% data.frame %>% kable 
+```
